@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/openfx", "crates/openfx-pixels"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+authors = ["MikanseiLaboratory"]
+repository = "https://github.com/MikanseiLaboratory/openfx-pixels"
+
+[workspace.dependencies]
+bindgen = "0.72"
+openfx = { path = "crates/openfx" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
