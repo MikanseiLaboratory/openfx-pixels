@@ -18,3 +18,7 @@ criterion = "0.5"
 [[bench]]
 name = "convert"
 harness = false
+
+[[bench]]
+name = "threading"
+harness = false

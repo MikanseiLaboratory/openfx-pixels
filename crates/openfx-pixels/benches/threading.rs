@@ -1,11 +1,15 @@
+//! Compares serial vs OFX `multiThread` row scheduling.
+//!
+//! The mock host spawns real OS threads per `multiThread` call. A historical
+//! `std::thread::scope` chunk scheduler was ~10% faster in this environment
+//! (192 µs vs 213 µs at 1080p) but has been removed in favour of the OFX API.
+
 use criterion::{Criterion, criterion_group, criterion_main};
 use openfx::bindings::OfxMultiThreadSuiteV1;
 use openfx::image::{PixelComponents, PixelDepth, RectI};
 use openfx::status::kOfxStat;
 use openfx::MultiThread;
-use openfx_pixels::{
-    ConvertHost, ConvertSource, ConvertSpec, PackedOrder, packed_frame_hash, write_packed_row,
-};
+use openfx_pixels::{ConvertHost, ConvertSource, ConvertSpec};
 
 static BENCH_SUITE: OfxMultiThreadSuiteV1 = OfxMultiThreadSuiteV1 {
     multiThread: Some(bench_multi_thread),
@@ -51,27 +55,7 @@ unsafe extern "C" fn bench_num_cpus(n_cpus: *mut u32) -> openfx::OfxStatus {
     kOfxStat::OK
 }
 
-fn bench_row(c: &mut Criterion) {
-    let mut src = vec![0u8; 1920 * 4];
-    for (i, b) in src.iter_mut().enumerate() {
-        *b = (i * 13 + 7) as u8;
-    }
-    let mut dst = vec![0u8; 1920 * 4];
-    c.bench_function("write_packed_row_byte_1920", |b| {
-        b.iter(|| unsafe {
-            write_packed_row(
-                PackedOrder::Bgra,
-                PixelDepth::Byte,
-                PixelComponents::Rgba,
-                src.as_ptr(),
-                &mut dst,
-                1920,
-            )
-        });
-    });
-}
-
-fn bench_window(c: &mut Criterion) {
+fn bench_1080p(c: &mut Criterion) {
     let window = RectI {
         x1: 0,
         y1: 0,
@@ -90,11 +74,16 @@ fn bench_window(c: &mut Criterion) {
         depth: PixelDepth::Byte,
         components: PixelComponents::Rgba,
     };
+    let spec = ConvertSpec {
+        track_alpha: false,
+        ..ConvertSpec::BGRA_VMX
+    };
     let host = Some(ConvertHost {
         multithread: &BENCH_MT,
     });
 
-    c.bench_function("convert_window_1080p_serial", |b| {
+    let mut group = c.benchmark_group("convert_1080p_threading");
+    group.bench_function("serial", |b| {
         b.iter(|| unsafe {
             openfx_pixels::convert_window_into(
                 Vec::new(),
@@ -108,28 +97,13 @@ fn bench_window(c: &mut Criterion) {
             )
         });
     });
-
-    c.bench_function("convert_window_1080p_ofx_parallel", |b| {
+    group.bench_function("ofx_multithread_stride", |b| {
         b.iter(|| unsafe {
-            openfx_pixels::convert_window_into(
-                Vec::new(),
-                source,
-                ConvertSpec {
-                    track_alpha: false,
-                    ..ConvertSpec::BGRA_VMX
-                },
-                host,
-            )
+            openfx_pixels::convert_window_into(Vec::new(), source, spec, host)
         });
     });
+    group.finish();
 }
 
-fn bench_hash(c: &mut Criterion) {
-    let data = vec![0u8; 1920 * 1080 * 4];
-    c.bench_function("packed_frame_hash_1080p", |b| {
-        b.iter(|| packed_frame_hash(1920, 1080, &data));
-    });
-}
-
-criterion_group!(benches, bench_row, bench_window, bench_hash);
-criterion_main!(benches);
+criterion_group!(threading_benches, bench_1080p);
+criterion_main!(threading_benches);
