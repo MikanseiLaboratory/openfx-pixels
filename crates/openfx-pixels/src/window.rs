@@ -208,12 +208,6 @@ pub unsafe fn convert_window_into(
     let bpp = depth.bytes_per_channel() * components.count();
     let stride = (width as usize).saturating_mul(4);
     let needed = stride.saturating_mul(height as usize);
-    packed.clear();
-    if packed.capacity() < needed {
-        packed.reserve(needed);
-    }
-    // SAFETY: every pixel in the output rectangle is written below.
-    unsafe { packed.set_len(needed) };
     let x1 = window.x1.max(bounds.x1);
     let x2 = window.x2.min(bounds.x2);
     if x2 <= x1 {
@@ -221,6 +215,21 @@ pub unsafe fn convert_window_into(
     }
     let count = (x2 - x1) as usize;
     let dst_x0 = (x1 - window.x1) as usize;
+    // Rows outside `bounds` are skipped, and only `[x1, x2)` is written. Zero-fill
+    // unless the window is fully contained so every output pixel is overwritten.
+    let fully_covered =
+        dst_x0 == 0 && count == width as usize && window.y1 >= bounds.y1 && window.y2 <= bounds.y2;
+    packed.clear();
+    if fully_covered {
+        if packed.capacity() < needed {
+            packed.reserve(needed);
+        }
+        // SAFETY: `convert_one_row` writes every output pixel when `window` is
+        // fully contained in `bounds`.
+        unsafe { packed.set_len(needed) };
+    } else {
+        packed.resize(needed, 0);
+    }
     let writer = RowWriter::resolve(spec.order, depth, components);
     let ctx = RowConvertCtx {
         window,
@@ -541,6 +550,119 @@ mod tests {
 
         assert_eq!(serial.data, ofx_parallel.data);
         assert_eq!(serial.has_alpha, ofx_parallel.has_alpha);
+    }
+
+    #[test]
+    fn partial_overlap_zero_fills_unwritten_pixels() {
+        let bounds = RectI {
+            x1: 8,
+            y1: 8,
+            x2: 24,
+            y2: 24,
+        };
+        let window = RectI {
+            x1: 0,
+            y1: 0,
+            x2: 32,
+            y2: 32,
+        };
+        let mut src = vec![0u8; 16 * 16 * 4];
+        for (i, px) in src.chunks_exact_mut(4).enumerate() {
+            px.copy_from_slice(&[(i % 251) as u8 + 1, 40, 80, 255]);
+        }
+        let source = ConvertSource {
+            window,
+            bounds,
+            row_bytes: 16 * 4,
+            data: src.as_ptr(),
+            depth: PixelDepth::Byte,
+            components: PixelComponents::Rgba,
+        };
+
+        let serial = unsafe {
+            convert_window_into(
+                Vec::new(),
+                source,
+                ConvertSpec {
+                    parallel_rows: false,
+                    ..ConvertSpec::RGBA
+                },
+                None,
+            )
+        }
+        .expect("serial partial overlap");
+        let parallel = unsafe {
+            convert_window_into(
+                Vec::new(),
+                source,
+                ConvertSpec::RGBA,
+                Some(ConvertHost {
+                    multithread: test_multithread(),
+                }),
+            )
+        }
+        .expect("parallel partial overlap");
+
+        assert_eq!(serial.width, 32);
+        assert_eq!(serial.height, 32);
+        assert_eq!(serial.data, parallel.data);
+
+        let stride = 32 * 4;
+        for y in 0..32usize {
+            for x in 0..32usize {
+                let px = &serial.data[y * stride + x * 4..][..4];
+                let inside = (8..24).contains(&x) && (8..24).contains(&y);
+                if inside {
+                    let sx = x as i32;
+                    let sy = 31 - y as i32;
+                    let src_i = ((sy - 8) as usize) * 16 + ((sx - 8) as usize);
+                    assert_eq!(
+                        px,
+                        &[(src_i % 251) as u8 + 1, 40, 80, 255],
+                        "written pixel ({x},{y})"
+                    );
+                } else {
+                    assert_eq!(px, &[0, 0, 0, 0], "unwritten pixel ({x},{y})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn disjoint_x_window_is_empty() {
+        let window = RectI {
+            x1: 0,
+            y1: 0,
+            x2: 32,
+            y2: 32,
+        };
+        let bounds = RectI {
+            x1: 40,
+            y1: 0,
+            x2: 72,
+            y2: 32,
+        };
+        let src = vec![0u8; 32 * 32 * 4];
+        let err = unsafe {
+            convert_window_into(
+                Vec::new(),
+                ConvertSource {
+                    window,
+                    bounds,
+                    row_bytes: 32 * 4,
+                    data: src.as_ptr(),
+                    depth: PixelDepth::Byte,
+                    components: PixelComponents::Rgba,
+                },
+                ConvertSpec {
+                    parallel_rows: false,
+                    ..ConvertSpec::RGBA
+                },
+                None,
+            )
+        }
+        .unwrap_err();
+        assert!(matches!(err, MediaError::EmptyWindow));
     }
 
     #[test]
