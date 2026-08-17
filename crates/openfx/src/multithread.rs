@@ -17,7 +17,8 @@ impl MultiThread {
     pub unsafe fn fetch(host: Host) -> OfxResult<Self> {
         let suite = unsafe { host.fetch(kOfxMultiThreadSuite, 1) } as *const OfxMultiThreadSuiteV1;
         Ok(Self {
-            suite: unsafe { suite.as_ref() }.ok_or(crate::status::kOfxStat::ErrMissingHostFeature)?,
+            suite: unsafe { suite.as_ref() }
+                .ok_or(crate::status::kOfxStat::ErrMissingHostFeature)?,
         })
     }
 
@@ -66,16 +67,12 @@ impl MultiThread {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::status::kOfxStat;
     use crate::OfxStatus;
+    use crate::status::kOfxStat;
     use std::ptr;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    unsafe extern "C" fn count_worker(
-        thread_index: u32,
-        thread_max: u32,
-        custom_arg: *mut c_void,
-    ) {
+    unsafe extern "C" fn count_worker(thread_index: u32, thread_max: u32, custom_arg: *mut c_void) {
         let seen = unsafe { &*(custom_arg as *mut AtomicU32) };
         seen.fetch_add(1 << thread_index, Ordering::SeqCst);
         assert!(thread_index < thread_max);

@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use openfx::image::{PixelComponents, PixelDepth, RectI, pixel_byte_offset};
 use openfx::MultiThread;
+use openfx::image::{PixelComponents, PixelDepth, RectI, pixel_byte_offset};
 
 use crate::convert::{PackedOrder, RowWriter};
 
@@ -236,9 +236,7 @@ pub unsafe fn convert_window_into(
     };
 
     let has_alpha = if spec.parallel_rows && height > 1 {
-        let multithread = host
-            .ok_or(MediaError::MissingMultiThread)?
-            .multithread;
+        let multithread = host.ok_or(MediaError::MissingMultiThread)?.multithread;
         unsafe { convert_rows_ofx(multithread, &packed, height, ctx) }
             .map_err(|_| MediaError::ParallelFailed)?
     } else {
@@ -343,10 +341,7 @@ unsafe fn convert_rows_ofx(
     height: u32,
     ctx: RowConvertCtx,
 ) -> Result<bool, openfx::OfxStatus> {
-    let n_threads = multithread
-        .num_cpus()?
-        .min(height)
-        .max(1);
+    let n_threads = multithread.num_cpus()?.min(height).max(1);
     let work = RowParallelWork {
         base: packed.as_ptr() as usize,
         height,

@@ -5,10 +5,10 @@
 //! (192 µs vs 213 µs at 1080p) but has been removed in favour of the OFX API.
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use openfx::MultiThread;
 use openfx::bindings::OfxMultiThreadSuiteV1;
 use openfx::image::{PixelComponents, PixelDepth, RectI};
 use openfx::status::kOfxStat;
-use openfx::MultiThread;
 use openfx_pixels::{ConvertHost, ConvertSource, ConvertSpec};
 
 static BENCH_SUITE: OfxMultiThreadSuiteV1 = OfxMultiThreadSuiteV1 {
@@ -98,9 +98,7 @@ fn bench_1080p(c: &mut Criterion) {
         });
     });
     group.bench_function("ofx_multithread_stride", |b| {
-        b.iter(|| unsafe {
-            openfx_pixels::convert_window_into(Vec::new(), source, spec, host)
-        });
+        b.iter(|| unsafe { openfx_pixels::convert_window_into(Vec::new(), source, spec, host) });
     });
     group.finish();
 }

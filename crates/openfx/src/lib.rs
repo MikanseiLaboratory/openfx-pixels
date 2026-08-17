@@ -23,7 +23,7 @@ pub use bindings::{
 };
 pub use image::{ClipImage, PixelComponents, PixelDepth, RectI, pixel_byte_offset};
 pub use instance::{drop_instance_data, get_instance_data, set_instance_data};
+pub use multithread::MultiThread;
 pub use plugin::{ImageEffectPlugin, catch_plugin_panic};
 pub use status::{OfxResult, OfxStatus, kOfxStat};
-pub use multithread::MultiThread;
 pub use suites::{Host, ParamSet, PropertySet, Suites};

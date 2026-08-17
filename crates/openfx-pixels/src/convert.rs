@@ -837,7 +837,15 @@ mod tests {
         let has_simd =
             unsafe { write_packed_row(order, depth, components, src.as_ptr(), &mut simd, count) };
         let has_scalar = unsafe {
-            write_packed_row_scalar(order, depth, components, src.as_ptr(), &mut scalar, count, true)
+            write_packed_row_scalar(
+                order,
+                depth,
+                components,
+                src.as_ptr(),
+                &mut scalar,
+                count,
+                true,
+            )
         };
         (simd, scalar, has_simd, has_scalar)
     }

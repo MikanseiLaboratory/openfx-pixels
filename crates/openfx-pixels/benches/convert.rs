@@ -1,8 +1,8 @@
 use criterion::{Criterion, criterion_group, criterion_main};
+use openfx::MultiThread;
 use openfx::bindings::OfxMultiThreadSuiteV1;
 use openfx::image::{PixelComponents, PixelDepth, RectI};
 use openfx::status::kOfxStat;
-use openfx::MultiThread;
 use openfx_pixels::{
     ConvertHost, ConvertSource, ConvertSpec, PackedOrder, packed_frame_hash, write_packed_row,
 };
