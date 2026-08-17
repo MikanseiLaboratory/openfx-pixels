@@ -1,7 +1,7 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use openfx::image::{PixelComponents, PixelDepth, RectI};
 use openfx_pixels::{
-    ConvertSource, ConvertSpec, PackedOrder, packed_frame_hash, write_packed_row,
+    ConvertHost, ConvertSource, ConvertSpec, PackedOrder, packed_frame_hash, write_packed_row,
 };
 
 fn bench_row(c: &mut Criterion) {
@@ -54,6 +54,7 @@ fn bench_window(c: &mut Criterion) {
                     track_alpha: false,
                     ..ConvertSpec::BGRA_VMX
                 },
+                ConvertHost::default(),
             )
         });
     });
@@ -67,6 +68,7 @@ fn bench_window(c: &mut Criterion) {
                     track_alpha: false,
                     ..ConvertSpec::BGRA_VMX
                 },
+                ConvertHost::default(),
             )
         });
     });
