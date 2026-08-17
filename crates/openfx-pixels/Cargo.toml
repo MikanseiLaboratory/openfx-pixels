@@ -1,0 +1,13 @@
+[package]
+name = "openfx-pixels"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "Shared SIMD OFX window conversion for OMT and NDI send plugins"
+
+[dependencies]
+openfx.workspace = true
