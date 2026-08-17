@@ -1,6 +1,9 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use openfx::image::{PixelComponents, PixelDepth, RectI, pixel_byte_offset};
 
-use crate::convert::{PackedOrder, write_packed_row};
+use crate::convert::{PackedOrder, RowWriter};
 
 pub const DEFAULT_MIN_VIDEO_DIM: u32 = 16;
 
@@ -9,6 +12,10 @@ pub struct ConvertSpec {
     pub order: PackedOrder,
     pub min_dim: u32,
     pub even_align: bool,
+    /// Process scanlines on multiple CPU cores. Enabled by default.
+    pub parallel_rows: bool,
+    /// Scan each row for non-opaque alpha. Disable when callers do not need `has_alpha`.
+    pub track_alpha: bool,
 }
 
 impl ConvertSpec {
@@ -16,12 +23,16 @@ impl ConvertSpec {
         order: PackedOrder::Bgra,
         min_dim: DEFAULT_MIN_VIDEO_DIM,
         even_align: true,
+        parallel_rows: true,
+        track_alpha: true,
     };
 
     pub const RGBA: Self = Self {
         order: PackedOrder::Rgba,
         min_dim: DEFAULT_MIN_VIDEO_DIM,
         even_align: false,
+        parallel_rows: true,
+        track_alpha: true,
     };
 }
 
@@ -174,7 +185,11 @@ pub unsafe fn convert_window_into(
     let stride = (width as usize).saturating_mul(4);
     let needed = stride.saturating_mul(height as usize);
     packed.clear();
-    packed.resize(needed, 0);
+    if packed.capacity() < needed {
+        packed.reserve(needed);
+    }
+    // SAFETY: every pixel in the output rectangle is written below.
+    unsafe { packed.set_len(needed) };
     let x1 = window.x1.max(bounds.x1);
     let x2 = window.x2.min(bounds.x2);
     if x2 <= x1 {
@@ -182,29 +197,25 @@ pub unsafe fn convert_window_into(
     }
     let count = (x2 - x1) as usize;
     let dst_x0 = (x1 - window.x1) as usize;
+    let writer = RowWriter::resolve(spec.order, depth, components);
+    let ctx = RowConvertCtx {
+        window,
+        bounds,
+        row_bytes,
+        data: data as usize,
+        bpp,
+        stride,
+        count,
+        dst_x0,
+        writer,
+        track_alpha: spec.track_alpha,
+    };
 
-    let mut has_alpha = false;
-    for out_y in 0..height as i32 {
-        let src_y = window.y2 - 1 - out_y;
-        if src_y < bounds.y1 || src_y >= bounds.y2 {
-            continue;
-        }
-        let Ok(offset) = pixel_byte_offset(bounds, row_bytes, bpp, x1, src_y) else {
-            continue;
-        };
-        let src = unsafe { data.offset(offset) };
-        let dst_row = out_y as usize * stride + dst_x0 * 4;
-        has_alpha |= unsafe {
-            write_packed_row(
-                spec.order,
-                depth,
-                components,
-                src,
-                &mut packed[dst_row..dst_row + count * 4],
-                count,
-            )
-        };
-    }
+    let has_alpha = if spec.parallel_rows && height > 1 {
+        unsafe { convert_rows_parallel(&packed, height, ctx) }
+    } else {
+        unsafe { convert_rows_serial(&mut packed, height, ctx) }
+    };
 
     Ok(ConvertedVideo {
         width,
@@ -214,6 +225,92 @@ pub unsafe fn convert_window_into(
         has_alpha,
         order: spec.order,
     })
+}
+
+#[derive(Clone, Copy)]
+struct RowConvertCtx {
+    window: RectI,
+    bounds: RectI,
+    row_bytes: i32,
+    data: usize,
+    bpp: usize,
+    stride: usize,
+    count: usize,
+    dst_x0: usize,
+    writer: RowWriter,
+    track_alpha: bool,
+}
+
+#[inline]
+unsafe fn convert_one_row(packed: *mut u8, out_y: i32, ctx: &RowConvertCtx) -> bool {
+    let RowConvertCtx {
+        window,
+        bounds,
+        row_bytes,
+        data: _,
+        bpp,
+        stride,
+        count,
+        dst_x0,
+        writer,
+        track_alpha,
+    } = *ctx;
+    let src_y = window.y2 - 1 - out_y;
+    if src_y < bounds.y1 || src_y >= bounds.y2 {
+        return false;
+    }
+    let Ok(offset) = pixel_byte_offset(bounds, row_bytes, bpp, window.x1.max(bounds.x1), src_y)
+    else {
+        return false;
+    };
+    let src = unsafe { (ctx.data as *const u8).offset(offset) };
+    let dst_row = out_y as usize * stride + dst_x0 * 4;
+    unsafe {
+        writer.write_row(
+            src,
+            std::slice::from_raw_parts_mut(packed.add(dst_row), count * 4),
+            count,
+            track_alpha,
+        )
+    }
+}
+
+unsafe fn convert_rows_serial(packed: &mut [u8], height: u32, ctx: RowConvertCtx) -> bool {
+    let base = packed.as_mut_ptr();
+    let mut has_alpha = false;
+    for out_y in 0..height as i32 {
+        has_alpha |= unsafe { convert_one_row(base, out_y, &ctx) };
+    }
+    has_alpha
+}
+
+unsafe fn convert_rows_parallel(packed: &[u8], height: u32, ctx: RowConvertCtx) -> bool {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, height as usize);
+    let chunk = (height as usize).div_ceil(threads);
+    let base = packed.as_ptr() as usize;
+    let has_alpha = Arc::new(AtomicBool::new(false));
+
+    std::thread::scope(|scope| {
+        for chunk_start in (0..height as usize).step_by(chunk) {
+            let chunk_end = (chunk_start + chunk).min(height as usize);
+            let has_alpha = Arc::clone(&has_alpha);
+            scope.spawn(move || {
+                let base = base as *mut u8;
+                let mut local_alpha = false;
+                for out_y in chunk_start..chunk_end {
+                    local_alpha |= unsafe { convert_one_row(base, out_y as i32, &ctx) };
+                }
+                if local_alpha {
+                    has_alpha.store(true, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+
+    has_alpha.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -287,5 +384,58 @@ mod tests {
         .expect("rgba convert");
         assert_eq!(converted.order, PackedOrder::Rgba);
         assert_eq!(converted.width, 16);
+    }
+
+    #[test]
+    fn parallel_matches_serial() {
+        let window = RectI {
+            x1: 0,
+            y1: 0,
+            x2: 64,
+            y2: 64,
+        };
+        let mut src = vec![0u8; 64 * 64 * 4];
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = (i * 17 + 3) as u8;
+        }
+        src[7] = 128;
+
+        let serial = unsafe {
+            convert_window_into(
+                Vec::new(),
+                ConvertSource {
+                    window,
+                    bounds: window,
+                    row_bytes: 64 * 4,
+                    data: src.as_ptr(),
+                    depth: PixelDepth::Byte,
+                    components: PixelComponents::Rgba,
+                },
+                ConvertSpec {
+                    parallel_rows: false,
+                    ..ConvertSpec::RGBA
+                },
+            )
+        }
+        .expect("serial");
+
+        let parallel = unsafe {
+            convert_window_into(
+                Vec::new(),
+                ConvertSource {
+                    window,
+                    bounds: window,
+                    row_bytes: 64 * 4,
+                    data: src.as_ptr(),
+                    depth: PixelDepth::Byte,
+                    components: PixelComponents::Rgba,
+                },
+                ConvertSpec::RGBA,
+            )
+        }
+        .expect("parallel");
+
+        assert_eq!(serial.data, parallel.data);
+        assert_eq!(serial.has_alpha, parallel.has_alpha);
     }
 }

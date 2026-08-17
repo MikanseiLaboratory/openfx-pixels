@@ -77,6 +77,60 @@ pub fn convert_simd_path() -> ConvertSimdPath {
     *PATH.get_or_init(ConvertSimdPath::detect)
 }
 
+type RowWriteFn = unsafe fn(
+    order: PackedOrder,
+    depth: PixelDepth,
+    components: PixelComponents,
+    src: *const u8,
+    dst: &mut [u8],
+    count: usize,
+    track_alpha: bool,
+) -> bool;
+
+/// Cached OFX→packed row writer for a fixed format. Avoids per-row SIMD dispatch.
+#[derive(Clone, Copy)]
+pub struct RowWriter {
+    write: RowWriteFn,
+    order: PackedOrder,
+    depth: PixelDepth,
+    components: PixelComponents,
+}
+
+impl RowWriter {
+    pub fn resolve(order: PackedOrder, depth: PixelDepth, components: PixelComponents) -> Self {
+        Self {
+            write: write_packed_row_inner,
+            order,
+            depth,
+            components,
+        }
+    }
+
+    /// # Safety
+    /// Same as [`write_packed_row`].
+    #[inline]
+    pub unsafe fn write_row(
+        &self,
+        src: *const u8,
+        dst: &mut [u8],
+        count: usize,
+        track_alpha: bool,
+    ) -> bool {
+        debug_assert!(dst.len() >= count.saturating_mul(4));
+        unsafe {
+            (self.write)(
+                self.order,
+                self.depth,
+                self.components,
+                src,
+                dst,
+                count,
+                track_alpha,
+            )
+        }
+    }
+}
+
 /// Convert `count` OFX pixels into packed 8-bit BGRA or RGBA.
 ///
 /// # Safety
@@ -89,48 +143,62 @@ pub unsafe fn write_packed_row(
     dst: &mut [u8],
     count: usize,
 ) -> bool {
+    unsafe { write_packed_row_inner(order, depth, components, src, dst, count, true) }
+}
+
+unsafe fn write_packed_row_inner(
+    order: PackedOrder,
+    depth: PixelDepth,
+    components: PixelComponents,
+    src: *const u8,
+    dst: &mut [u8],
+    count: usize,
+    track_alpha: bool,
+) -> bool {
     debug_assert!(dst.len() >= count.saturating_mul(4));
     let swizzle = order.swizzle_bgra();
     match (convert_simd_path(), depth, components) {
         #[cfg(target_arch = "x86_64")]
         (ConvertSimdPath::Avx2, PixelDepth::Float, PixelComponents::Rgba) => unsafe {
-            x86::write_float_rgba_avx2(src, dst, count, swizzle)
+            x86::write_float_rgba_avx2(src, dst, count, swizzle, track_alpha)
         },
         #[cfg(target_arch = "x86_64")]
         (ConvertSimdPath::Avx2, PixelDepth::Byte, PixelComponents::Rgba) => unsafe {
-            x86::write_byte_rgba_avx2(src, dst, count, swizzle)
+            x86::write_byte_rgba_avx2(src, dst, count, swizzle, track_alpha)
         },
         #[cfg(target_arch = "x86_64")]
         (ConvertSimdPath::Avx2, PixelDepth::Short, PixelComponents::Rgba) => unsafe {
-            x86::write_short_rgba_avx2(src, dst, count, swizzle)
+            x86::write_short_rgba_avx2(src, dst, count, swizzle, track_alpha)
         },
         #[cfg(target_arch = "x86_64")]
         (ConvertSimdPath::Ssse3, PixelDepth::Byte, PixelComponents::Rgba) => unsafe {
-            x86::write_byte_rgba_ssse3(src, dst, count, swizzle)
+            x86::write_byte_rgba_ssse3(src, dst, count, swizzle, track_alpha)
         },
         #[cfg(target_arch = "x86_64")]
         (ConvertSimdPath::Ssse3, PixelDepth::Short, PixelComponents::Rgba) => unsafe {
-            x86::write_short_rgba_ssse3(src, dst, count, swizzle)
+            x86::write_short_rgba_ssse3(src, dst, count, swizzle, track_alpha)
         },
         #[cfg(target_arch = "x86_64")]
         (
             ConvertSimdPath::Sse2 | ConvertSimdPath::Ssse3,
             PixelDepth::Float,
             PixelComponents::Rgba,
-        ) => unsafe { x86::write_float_rgba_sse2(src, dst, count, swizzle) },
+        ) => unsafe { x86::write_float_rgba_sse2(src, dst, count, swizzle, track_alpha) },
         #[cfg(target_arch = "aarch64")]
         (ConvertSimdPath::Neon, PixelDepth::Float, PixelComponents::Rgba) => unsafe {
-            neon::write_float_rgba(src, dst, count, swizzle)
+            neon::write_float_rgba(src, dst, count, swizzle, track_alpha)
         },
         #[cfg(target_arch = "aarch64")]
         (ConvertSimdPath::Neon, PixelDepth::Byte, PixelComponents::Rgba) => unsafe {
-            neon::write_byte_rgba(src, dst, count, swizzle)
+            neon::write_byte_rgba(src, dst, count, swizzle, track_alpha)
         },
         #[cfg(target_arch = "aarch64")]
         (ConvertSimdPath::Neon, PixelDepth::Short, PixelComponents::Rgba) => unsafe {
-            neon::write_short_rgba(src, dst, count, swizzle)
+            neon::write_short_rgba(src, dst, count, swizzle, track_alpha)
         },
-        _ => unsafe { write_packed_row_scalar(order, depth, components, src, dst, count) },
+        _ => unsafe {
+            write_packed_row_scalar(order, depth, components, src, dst, count, track_alpha)
+        },
     }
 }
 
@@ -141,6 +209,7 @@ pub(crate) unsafe fn write_packed_row_scalar(
     src: *const u8,
     dst: &mut [u8],
     count: usize,
+    track_alpha: bool,
 ) -> bool {
     let ch = depth.bytes_per_channel();
     let src_bpp = ch * components.count();
@@ -156,7 +225,7 @@ pub(crate) unsafe fn write_packed_row_scalar(
         } else {
             255
         };
-        if a != 255 {
+        if track_alpha && a != 255 {
             has_alpha = true;
         }
         let o = i * 4;
@@ -243,6 +312,7 @@ mod x86 {
         dst: &mut [u8],
         count: usize,
         swizzle: bool,
+        track_alpha: bool,
     ) -> bool {
         unsafe {
             let zero = _mm256_setzero_ps();
@@ -259,15 +329,22 @@ mod x86 {
                 let d = load2_i32(base.add(24), zero, one, scale, swizzle);
                 let p0 = pack4(a, b);
                 let p1 = pack4(c, d);
-                has_alpha |=
-                    alpha_mismatch_128(p0, alpha_mask) || alpha_mismatch_128(p1, alpha_mask);
+                if track_alpha {
+                    has_alpha |=
+                        alpha_mismatch_128(p0, alpha_mask) || alpha_mismatch_128(p1, alpha_mask);
+                }
                 _mm_storeu_si128(dst.as_mut_ptr().add(i * 4) as *mut __m128i, p0);
                 _mm_storeu_si128(dst.as_mut_ptr().add(i * 4 + 16) as *mut __m128i, p1);
                 i += 8;
             }
             if i < count {
-                has_alpha |=
-                    write_float_rgba_sse2(src.add(i * 16), &mut dst[i * 4..], count - i, swizzle);
+                has_alpha |= write_float_rgba_sse2(
+                    src.add(i * 16),
+                    &mut dst[i * 4..],
+                    count - i,
+                    swizzle,
+                    track_alpha,
+                );
             }
             has_alpha
         }
@@ -330,6 +407,7 @@ mod x86 {
         dst: &mut [u8],
         count: usize,
         swizzle: bool,
+        track_alpha: bool,
     ) -> bool {
         unsafe {
             let shuf128 = if swizzle {
@@ -344,16 +422,23 @@ mod x86 {
             while i + 8 <= count {
                 let v = _mm256_loadu_si256(src.add(i * 4) as *const __m256i);
                 let packed = _mm256_shuffle_epi8(v, shuf);
-                let eq = _mm256_cmpeq_epi8(_mm256_and_si256(packed, alpha_mask), alpha_mask);
-                if (_mm256_movemask_epi8(eq) as u32) & 0x8888_8888 != 0x8888_8888 {
-                    has_alpha = true;
+                if track_alpha {
+                    let eq = _mm256_cmpeq_epi8(_mm256_and_si256(packed, alpha_mask), alpha_mask);
+                    if (_mm256_movemask_epi8(eq) as u32) & 0x8888_8888 != 0x8888_8888 {
+                        has_alpha = true;
+                    }
                 }
                 _mm256_storeu_si256(dst.as_mut_ptr().add(i * 4) as *mut __m256i, packed);
                 i += 8;
             }
             if i < count {
-                has_alpha |=
-                    write_byte_rgba_ssse3(src.add(i * 4), &mut dst[i * 4..], count - i, swizzle);
+                has_alpha |= write_byte_rgba_ssse3(
+                    src.add(i * 4),
+                    &mut dst[i * 4..],
+                    count - i,
+                    swizzle,
+                    track_alpha,
+                );
             }
             has_alpha
         }
@@ -365,6 +450,7 @@ mod x86 {
         dst: &mut [u8],
         count: usize,
         swizzle: bool,
+        track_alpha: bool,
     ) -> bool {
         unsafe {
             let shuf = if swizzle {
@@ -374,24 +460,41 @@ mod x86 {
             };
             let mut has_alpha = false;
             let mut i = 0;
-            while i + 4 <= count {
-                let v = _mm256_loadu_si256(src.add(i * 8) as *const __m256i);
-                let hi = _mm256_srli_epi16(v, 8);
-                let packed8 = _mm256_packus_epi16(hi, _mm256_setzero_si256());
-                let lo = _mm256_castsi256_si128(packed8);
-                let hi128 = _mm256_extracti128_si256(packed8, 1);
-                let p01 = _mm_shuffle_epi8(lo, shuf);
-                let p23 = _mm_shuffle_epi8(hi128, shuf);
-                if short2_alpha_mismatch(p01) || short2_alpha_mismatch(p23) {
-                    has_alpha = true;
+            while i + 8 <= count {
+                let v0 = _mm256_loadu_si256(src.add(i * 8) as *const __m256i);
+                let v1 = _mm256_loadu_si256(src.add(i * 8 + 32) as *const __m256i);
+                let hi0 = _mm256_srli_epi16(v0, 8);
+                let hi1 = _mm256_srli_epi16(v1, 8);
+                let packed8_0 = _mm256_packus_epi16(hi0, _mm256_setzero_si256());
+                let packed8_1 = _mm256_packus_epi16(hi1, _mm256_setzero_si256());
+                let lo0 = _mm256_castsi256_si128(packed8_0);
+                let hi0_128 = _mm256_extracti128_si256(packed8_0, 1);
+                let lo1 = _mm256_castsi256_si128(packed8_1);
+                let hi1_128 = _mm256_extracti128_si256(packed8_1, 1);
+                let p01 = _mm_shuffle_epi8(lo0, shuf);
+                let p23 = _mm_shuffle_epi8(hi0_128, shuf);
+                let p45 = _mm_shuffle_epi8(lo1, shuf);
+                let p67 = _mm_shuffle_epi8(hi1_128, shuf);
+                if track_alpha {
+                    has_alpha |= short2_alpha_mismatch(p01)
+                        || short2_alpha_mismatch(p23)
+                        || short2_alpha_mismatch(p45)
+                        || short2_alpha_mismatch(p67);
                 }
                 _mm_storel_epi64(dst.as_mut_ptr().add(i * 4) as *mut __m128i, p01);
                 _mm_storel_epi64(dst.as_mut_ptr().add(i * 4 + 8) as *mut __m128i, p23);
-                i += 4;
+                _mm_storel_epi64(dst.as_mut_ptr().add(i * 4 + 16) as *mut __m128i, p45);
+                _mm_storel_epi64(dst.as_mut_ptr().add(i * 4 + 24) as *mut __m128i, p67);
+                i += 8;
             }
             if i < count {
-                has_alpha |=
-                    write_short_rgba_ssse3(src.add(i * 8), &mut dst[i * 4..], count - i, swizzle);
+                has_alpha |= write_short_rgba_ssse3(
+                    src.add(i * 8),
+                    &mut dst[i * 4..],
+                    count - i,
+                    swizzle,
+                    track_alpha,
+                );
             }
             has_alpha
         }
@@ -403,6 +506,7 @@ mod x86 {
         dst: &mut [u8],
         count: usize,
         swizzle: bool,
+        track_alpha: bool,
     ) -> bool {
         unsafe {
             let zero = _mm_setzero_ps();
@@ -418,7 +522,9 @@ mod x86 {
                 let t2 = cvt_pixel(_mm_loadu_ps(base.add(8)), zero, one, scale, swizzle);
                 let t3 = cvt_pixel(_mm_loadu_ps(base.add(12)), zero, one, scale, swizzle);
                 let packed = _mm_packus_epi16(_mm_packs_epi32(t0, t1), _mm_packs_epi32(t2, t3));
-                has_alpha |= alpha_mismatch_128(packed, alpha_mask);
+                if track_alpha {
+                    has_alpha |= alpha_mismatch_128(packed, alpha_mask);
+                }
                 _mm_storeu_si128(dst.as_mut_ptr().add(i * 4) as *mut __m128i, packed);
                 i += 4;
             }
@@ -430,6 +536,7 @@ mod x86 {
                     src.add(i * 16),
                     &mut dst[i * 4..],
                     count - i,
+                    track_alpha,
                 );
             }
             has_alpha
@@ -460,6 +567,7 @@ mod x86 {
         dst: &mut [u8],
         count: usize,
         swizzle: bool,
+        track_alpha: bool,
     ) -> bool {
         unsafe {
             let shuf = if swizzle {
@@ -473,7 +581,9 @@ mod x86 {
             while i + 4 <= count {
                 let packed =
                     _mm_shuffle_epi8(_mm_loadu_si128(src.add(i * 4) as *const __m128i), shuf);
-                has_alpha |= alpha_mismatch_128(packed, alpha_mask);
+                if track_alpha {
+                    has_alpha |= alpha_mismatch_128(packed, alpha_mask);
+                }
                 _mm_storeu_si128(dst.as_mut_ptr().add(i * 4) as *mut __m128i, packed);
                 i += 4;
             }
@@ -485,6 +595,7 @@ mod x86 {
                     src.add(i * 4),
                     &mut dst[i * 4..],
                     count - i,
+                    track_alpha,
                 );
             }
             has_alpha
@@ -497,6 +608,7 @@ mod x86 {
         dst: &mut [u8],
         count: usize,
         swizzle: bool,
+        track_alpha: bool,
     ) -> bool {
         unsafe {
             let shuf = if swizzle {
@@ -511,11 +623,12 @@ mod x86 {
                 let v = _mm_loadu_si128(src.add(i * 8) as *const __m128i);
                 let packed8 = _mm_packus_epi16(_mm_srli_epi16(v, 8), _mm_setzero_si128());
                 let packed = _mm_shuffle_epi8(packed8, shuf);
-                if _mm_movemask_epi8(_mm_cmpeq_epi8(
-                    _mm_and_si128(packed, alpha_mask),
-                    alpha_mask,
-                )) & 0x0088
-                    != 0x0088
+                if track_alpha
+                    && _mm_movemask_epi8(_mm_cmpeq_epi8(
+                        _mm_and_si128(packed, alpha_mask),
+                        alpha_mask,
+                    )) & 0x0088
+                        != 0x0088
                 {
                     has_alpha = true;
                 }
@@ -533,6 +646,7 @@ mod x86 {
                     src.add(i * 8),
                     &mut dst[i * 4..],
                     count - i,
+                    track_alpha,
                 );
             }
             has_alpha
@@ -559,6 +673,7 @@ mod neon {
         dst: &mut [u8],
         count: usize,
         swizzle: bool,
+        track_alpha: bool,
     ) -> bool {
         unsafe {
             let zero = vdupq_n_f32(0.0);
@@ -581,7 +696,9 @@ mod neon {
                 let n01 = vcombine_s16(vqmovn_s32(t0), vqmovn_s32(t1));
                 let n23 = vcombine_s16(vqmovn_s32(t2), vqmovn_s32(t3));
                 let packed = vcombine_u8(vqmovun_s16(n01), vqmovun_s16(n23));
-                has_alpha |= neon_alpha_mismatch(packed);
+                if track_alpha {
+                    has_alpha |= neon_alpha_mismatch(packed);
+                }
                 vst1q_u8(dst.as_mut_ptr().add(i * 4), packed);
                 i += 4;
             }
@@ -593,6 +710,7 @@ mod neon {
                     src.add(i * 16),
                     &mut dst[i * 4..],
                     count - i,
+                    track_alpha,
                 );
             }
             has_alpha
@@ -627,6 +745,7 @@ mod neon {
         dst: &mut [u8],
         count: usize,
         swizzle: bool,
+        track_alpha: bool,
     ) -> bool {
         unsafe {
             let idx_bytes = if swizzle {
@@ -639,7 +758,9 @@ mod neon {
             let mut i = 0;
             while i + 4 <= count {
                 let packed = vqtbl1q_u8(vld1q_u8(src.add(i * 4)), idx);
-                has_alpha |= neon_alpha_mismatch(packed);
+                if track_alpha {
+                    has_alpha |= neon_alpha_mismatch(packed);
+                }
                 vst1q_u8(dst.as_mut_ptr().add(i * 4), packed);
                 i += 4;
             }
@@ -651,6 +772,7 @@ mod neon {
                     src.add(i * 4),
                     &mut dst[i * 4..],
                     count - i,
+                    track_alpha,
                 );
             }
             has_alpha
@@ -663,6 +785,7 @@ mod neon {
         dst: &mut [u8],
         count: usize,
         swizzle: bool,
+        track_alpha: bool,
     ) -> bool {
         unsafe {
             let idx_bytes = if swizzle {
@@ -676,7 +799,9 @@ mod neon {
             while i + 2 <= count {
                 let v = vld1q_u16(src.add(i * 8) as *const u16);
                 let packed8 = vtbl1_u8(vshrn_n_u16(v, 8), idx);
-                has_alpha |= vget_lane_u8(packed8, 3) != 255 || vget_lane_u8(packed8, 7) != 255;
+                if track_alpha {
+                    has_alpha |= vget_lane_u8(packed8, 3) != 255 || vget_lane_u8(packed8, 7) != 255;
+                }
                 vst1_u8(dst.as_mut_ptr().add(i * 4), packed8);
                 i += 2;
             }
@@ -688,6 +813,7 @@ mod neon {
                     src.add(i * 8),
                     &mut dst[i * 4..],
                     count - i,
+                    track_alpha,
                 );
             }
             has_alpha
@@ -711,7 +837,7 @@ mod tests {
         let has_simd =
             unsafe { write_packed_row(order, depth, components, src.as_ptr(), &mut simd, count) };
         let has_scalar = unsafe {
-            write_packed_row_scalar(order, depth, components, src.as_ptr(), &mut scalar, count)
+            write_packed_row_scalar(order, depth, components, src.as_ptr(), &mut scalar, count, true)
         };
         (simd, scalar, has_simd, has_scalar)
     }

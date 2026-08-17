@@ -12,7 +12,8 @@ mod window;
 
 pub use clock::{SessionClock, TICKS_PER_SECOND, video_interval_ticks};
 pub use convert::{
-    ConvertSimdPath, PackedOrder, convert_simd_path, packed_row_to_pixel, write_packed_row,
+    ConvertSimdPath, PackedOrder, RowWriter, convert_simd_path, packed_row_to_pixel,
+    write_packed_row,
 };
 pub use copy::copy_image_window;
 pub use hash::packed_frame_hash;

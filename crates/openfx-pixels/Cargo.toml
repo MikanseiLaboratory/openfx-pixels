@@ -11,3 +11,10 @@ description = "Shared SIMD OFX window conversion for OMT and NDI send plugins"
 
 [dependencies]
 openfx.workspace = true
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "convert"
+harness = false
