@@ -36,7 +36,7 @@ impl Host {
         })
     }
 
-    unsafe fn fetch(&self, name: &CStr, version: c_int) -> *const c_void {
+    pub(crate) unsafe fn fetch(&self, name: &CStr, version: c_int) -> *const c_void {
         unsafe { (self.fetch_suite)(self.host, name.as_ptr(), version) }
     }
 }

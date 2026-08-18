@@ -1,14 +1,28 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use openfx::MultiThread;
 use openfx::image::{PixelComponents, PixelDepth, RectI, pixel_byte_offset};
 
-use crate::convert::{PackedOrder, write_packed_row};
+use crate::convert::{PackedOrder, RowWriter};
 
 pub const DEFAULT_MIN_VIDEO_DIM: u32 = 16;
+
+/// Host services required for parallel conversion.
+#[derive(Clone, Copy)]
+pub struct ConvertHost<'a> {
+    /// `OfxMultiThreadSuite` from the host. Required when [`ConvertSpec::parallel_rows`] is true.
+    pub multithread: &'a MultiThread,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConvertSpec {
     pub order: PackedOrder,
     pub min_dim: u32,
     pub even_align: bool,
+    /// Process scanlines on multiple CPU cores. Enabled by default.
+    pub parallel_rows: bool,
+    /// Scan each row for non-opaque alpha. Disable when callers do not need `has_alpha`.
+    pub track_alpha: bool,
 }
 
 impl ConvertSpec {
@@ -16,12 +30,16 @@ impl ConvertSpec {
         order: PackedOrder::Bgra,
         min_dim: DEFAULT_MIN_VIDEO_DIM,
         even_align: true,
+        parallel_rows: true,
+        track_alpha: true,
     };
 
     pub const RGBA: Self = Self {
         order: PackedOrder::Rgba,
         min_dim: DEFAULT_MIN_VIDEO_DIM,
         even_align: false,
+        parallel_rows: true,
+        track_alpha: true,
     };
 }
 
@@ -33,6 +51,10 @@ pub enum MediaError {
         min_dim: u32,
     },
     EmptyWindow,
+    /// [`ConvertSpec::parallel_rows`] was set without a [`ConvertHost::multithread`] handle.
+    MissingMultiThread,
+    /// `OfxMultiThreadSuite::multiThread` failed (e.g. recursive call).
+    ParallelFailed,
 }
 
 impl std::fmt::Display for MediaError {
@@ -47,6 +69,10 @@ impl std::fmt::Display for MediaError {
                 "video {width}x{height} is smaller than {min_dim}x{min_dim}"
             ),
             Self::EmptyWindow => write!(f, "render window is empty"),
+            Self::MissingMultiThread => {
+                write!(f, "parallel_rows requires ConvertHost::multithread")
+            }
+            Self::ParallelFailed => write!(f, "OfxMultiThreadSuite::multiThread failed"),
         }
     }
 }
@@ -96,7 +122,11 @@ pub unsafe fn convert_window_to_bgra(
                 depth,
                 components,
             },
-            ConvertSpec::BGRA_VMX,
+            ConvertSpec {
+                parallel_rows: false,
+                ..ConvertSpec::BGRA_VMX
+            },
+            None,
         )
     }
 }
@@ -124,7 +154,11 @@ pub unsafe fn convert_window_to_rgba(
                 depth,
                 components,
             },
-            ConvertSpec::RGBA,
+            ConvertSpec {
+                parallel_rows: false,
+                ..ConvertSpec::RGBA
+            },
+            None,
         )
     }
 }
@@ -137,6 +171,7 @@ pub unsafe fn convert_window_into(
     mut packed: Vec<u8>,
     source: ConvertSource,
     spec: ConvertSpec,
+    host: Option<ConvertHost<'_>>,
 ) -> Result<ConvertedVideo, MediaError> {
     let mut window = source.window;
     if spec.even_align {
@@ -173,8 +208,6 @@ pub unsafe fn convert_window_into(
     let bpp = depth.bytes_per_channel() * components.count();
     let stride = (width as usize).saturating_mul(4);
     let needed = stride.saturating_mul(height as usize);
-    packed.clear();
-    packed.resize(needed, 0);
     let x1 = window.x1.max(bounds.x1);
     let x2 = window.x2.min(bounds.x2);
     if x2 <= x1 {
@@ -182,29 +215,42 @@ pub unsafe fn convert_window_into(
     }
     let count = (x2 - x1) as usize;
     let dst_x0 = (x1 - window.x1) as usize;
-
-    let mut has_alpha = false;
-    for out_y in 0..height as i32 {
-        let src_y = window.y2 - 1 - out_y;
-        if src_y < bounds.y1 || src_y >= bounds.y2 {
-            continue;
+    // Rows outside `bounds` are skipped, and only `[x1, x2)` is written. Zero-fill
+    // unless the window is fully contained so every output pixel is overwritten.
+    let fully_covered =
+        dst_x0 == 0 && count == width as usize && window.y1 >= bounds.y1 && window.y2 <= bounds.y2;
+    packed.clear();
+    if fully_covered {
+        if packed.capacity() < needed {
+            packed.reserve(needed);
         }
-        let Ok(offset) = pixel_byte_offset(bounds, row_bytes, bpp, x1, src_y) else {
-            continue;
-        };
-        let src = unsafe { data.offset(offset) };
-        let dst_row = out_y as usize * stride + dst_x0 * 4;
-        has_alpha |= unsafe {
-            write_packed_row(
-                spec.order,
-                depth,
-                components,
-                src,
-                &mut packed[dst_row..dst_row + count * 4],
-                count,
-            )
-        };
+        // SAFETY: `convert_one_row` writes every output pixel when `window` is
+        // fully contained in `bounds`.
+        unsafe { packed.set_len(needed) };
+    } else {
+        packed.resize(needed, 0);
     }
+    let writer = RowWriter::resolve(spec.order, depth, components);
+    let ctx = RowConvertCtx {
+        window,
+        bounds,
+        row_bytes,
+        data: data as usize,
+        bpp,
+        stride,
+        count,
+        dst_x0,
+        writer,
+        track_alpha: spec.track_alpha,
+    };
+
+    let has_alpha = if spec.parallel_rows && height > 1 {
+        let multithread = host.ok_or(MediaError::MissingMultiThread)?.multithread;
+        unsafe { convert_rows_ofx(multithread, &packed, height, ctx) }
+            .map_err(|_| MediaError::ParallelFailed)?
+    } else {
+        unsafe { convert_rows_serial(&mut packed, height, ctx) }
+    };
 
     Ok(ConvertedVideo {
         width,
@@ -214,6 +260,109 @@ pub unsafe fn convert_window_into(
         has_alpha,
         order: spec.order,
     })
+}
+
+#[derive(Clone, Copy)]
+struct RowConvertCtx {
+    window: RectI,
+    bounds: RectI,
+    row_bytes: i32,
+    data: usize,
+    bpp: usize,
+    stride: usize,
+    count: usize,
+    dst_x0: usize,
+    writer: RowWriter,
+    track_alpha: bool,
+}
+
+#[inline]
+unsafe fn convert_one_row(packed: *mut u8, out_y: i32, ctx: &RowConvertCtx) -> bool {
+    let RowConvertCtx {
+        window,
+        bounds,
+        row_bytes,
+        data: _,
+        bpp,
+        stride,
+        count,
+        dst_x0,
+        writer,
+        track_alpha,
+    } = *ctx;
+    let src_y = window.y2 - 1 - out_y;
+    if src_y < bounds.y1 || src_y >= bounds.y2 {
+        return false;
+    }
+    let Ok(offset) = pixel_byte_offset(bounds, row_bytes, bpp, window.x1.max(bounds.x1), src_y)
+    else {
+        return false;
+    };
+    let src = unsafe { (ctx.data as *const u8).offset(offset) };
+    let dst_row = out_y as usize * stride + dst_x0 * 4;
+    unsafe {
+        writer.write_row(
+            src,
+            std::slice::from_raw_parts_mut(packed.add(dst_row), count * 4),
+            count,
+            track_alpha,
+        )
+    }
+}
+
+unsafe fn convert_rows_serial(packed: &mut [u8], height: u32, ctx: RowConvertCtx) -> bool {
+    let base = packed.as_mut_ptr();
+    let mut has_alpha = false;
+    for out_y in 0..height as i32 {
+        has_alpha |= unsafe { convert_one_row(base, out_y, &ctx) };
+    }
+    has_alpha
+}
+
+struct RowParallelWork {
+    base: usize,
+    height: u32,
+    ctx: RowConvertCtx,
+    has_alpha: AtomicBool,
+}
+
+unsafe extern "C" fn convert_rows_worker(
+    thread_index: u32,
+    thread_max: u32,
+    custom_arg: *mut std::ffi::c_void,
+) {
+    let work = unsafe { &*(custom_arg as *const RowParallelWork) };
+    let base = work.base as *mut u8;
+    let mut local_alpha = false;
+    let mut out_y = thread_index as i32;
+    while out_y < work.height as i32 {
+        local_alpha |= unsafe { convert_one_row(base, out_y, &work.ctx) };
+        out_y += thread_max as i32;
+    }
+    if local_alpha {
+        work.has_alpha.store(true, Ordering::Relaxed);
+    }
+}
+
+unsafe fn convert_rows_ofx(
+    multithread: &MultiThread,
+    packed: &[u8],
+    height: u32,
+    ctx: RowConvertCtx,
+) -> Result<bool, openfx::OfxStatus> {
+    let n_threads = multithread.num_cpus()?.min(height).max(1);
+    let work = RowParallelWork {
+        base: packed.as_ptr() as usize,
+        height,
+        ctx,
+        has_alpha: AtomicBool::new(false),
+    };
+    multithread.parallel(
+        n_threads,
+        Some(convert_rows_worker),
+        &work as *const RowParallelWork as *mut std::ffi::c_void,
+    )?;
+    Ok(work.has_alpha.load(Ordering::Relaxed))
 }
 
 #[cfg(test)]
@@ -287,5 +436,301 @@ mod tests {
         .expect("rgba convert");
         assert_eq!(converted.order, PackedOrder::Rgba);
         assert_eq!(converted.width, 16);
+    }
+
+    #[test]
+    fn parallel_matches_serial() {
+        let window = RectI {
+            x1: 0,
+            y1: 0,
+            x2: 64,
+            y2: 64,
+        };
+        let mut src = vec![0u8; 64 * 64 * 4];
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = (i * 17 + 3) as u8;
+        }
+        src[7] = 128;
+
+        let serial = unsafe {
+            convert_window_into(
+                Vec::new(),
+                ConvertSource {
+                    window,
+                    bounds: window,
+                    row_bytes: 64 * 4,
+                    data: src.as_ptr(),
+                    depth: PixelDepth::Byte,
+                    components: PixelComponents::Rgba,
+                },
+                ConvertSpec {
+                    parallel_rows: false,
+                    ..ConvertSpec::RGBA
+                },
+                None,
+            )
+        }
+        .expect("serial");
+
+        let parallel = unsafe {
+            convert_window_into(
+                Vec::new(),
+                ConvertSource {
+                    window,
+                    bounds: window,
+                    row_bytes: 64 * 4,
+                    data: src.as_ptr(),
+                    depth: PixelDepth::Byte,
+                    components: PixelComponents::Rgba,
+                },
+                ConvertSpec::RGBA,
+                Some(ConvertHost {
+                    multithread: test_multithread(),
+                }),
+            )
+        }
+        .expect("parallel");
+
+        assert_eq!(serial.data, parallel.data);
+        assert_eq!(serial.has_alpha, parallel.has_alpha);
+    }
+
+    #[test]
+    fn ofx_parallel_matches_serial() {
+        let window = RectI {
+            x1: 0,
+            y1: 0,
+            x2: 64,
+            y2: 64,
+        };
+        let mut src = vec![0u8; 64 * 64 * 4];
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = (i * 17 + 3) as u8;
+        }
+        src[7] = 128;
+
+        let serial = unsafe {
+            convert_window_into(
+                Vec::new(),
+                ConvertSource {
+                    window,
+                    bounds: window,
+                    row_bytes: 64 * 4,
+                    data: src.as_ptr(),
+                    depth: PixelDepth::Byte,
+                    components: PixelComponents::Rgba,
+                },
+                ConvertSpec {
+                    parallel_rows: false,
+                    ..ConvertSpec::RGBA
+                },
+                None,
+            )
+        }
+        .expect("serial");
+
+        let ofx_parallel = unsafe {
+            convert_window_into(
+                Vec::new(),
+                ConvertSource {
+                    window,
+                    bounds: window,
+                    row_bytes: 64 * 4,
+                    data: src.as_ptr(),
+                    depth: PixelDepth::Byte,
+                    components: PixelComponents::Rgba,
+                },
+                ConvertSpec::RGBA,
+                Some(ConvertHost {
+                    multithread: test_multithread(),
+                }),
+            )
+        }
+        .expect("ofx parallel");
+
+        assert_eq!(serial.data, ofx_parallel.data);
+        assert_eq!(serial.has_alpha, ofx_parallel.has_alpha);
+    }
+
+    #[test]
+    fn partial_overlap_zero_fills_unwritten_pixels() {
+        let bounds = RectI {
+            x1: 8,
+            y1: 8,
+            x2: 24,
+            y2: 24,
+        };
+        let window = RectI {
+            x1: 0,
+            y1: 0,
+            x2: 32,
+            y2: 32,
+        };
+        let mut src = vec![0u8; 16 * 16 * 4];
+        for (i, px) in src.chunks_exact_mut(4).enumerate() {
+            px.copy_from_slice(&[(i % 251) as u8 + 1, 40, 80, 255]);
+        }
+        let source = ConvertSource {
+            window,
+            bounds,
+            row_bytes: 16 * 4,
+            data: src.as_ptr(),
+            depth: PixelDepth::Byte,
+            components: PixelComponents::Rgba,
+        };
+
+        let serial = unsafe {
+            convert_window_into(
+                Vec::new(),
+                source,
+                ConvertSpec {
+                    parallel_rows: false,
+                    ..ConvertSpec::RGBA
+                },
+                None,
+            )
+        }
+        .expect("serial partial overlap");
+        let parallel = unsafe {
+            convert_window_into(
+                Vec::new(),
+                source,
+                ConvertSpec::RGBA,
+                Some(ConvertHost {
+                    multithread: test_multithread(),
+                }),
+            )
+        }
+        .expect("parallel partial overlap");
+
+        assert_eq!(serial.width, 32);
+        assert_eq!(serial.height, 32);
+        assert_eq!(serial.data, parallel.data);
+
+        let stride = 32 * 4;
+        for y in 0..32usize {
+            for x in 0..32usize {
+                let px = &serial.data[y * stride + x * 4..][..4];
+                let inside = (8..24).contains(&x) && (8..24).contains(&y);
+                if inside {
+                    let sx = x as i32;
+                    let sy = 31 - y as i32;
+                    let src_i = ((sy - 8) as usize) * 16 + ((sx - 8) as usize);
+                    assert_eq!(
+                        px,
+                        &[(src_i % 251) as u8 + 1, 40, 80, 255],
+                        "written pixel ({x},{y})"
+                    );
+                } else {
+                    assert_eq!(px, &[0, 0, 0, 0], "unwritten pixel ({x},{y})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn disjoint_x_window_is_empty() {
+        let window = RectI {
+            x1: 0,
+            y1: 0,
+            x2: 32,
+            y2: 32,
+        };
+        let bounds = RectI {
+            x1: 40,
+            y1: 0,
+            x2: 72,
+            y2: 32,
+        };
+        let src = vec![0u8; 32 * 32 * 4];
+        let err = unsafe {
+            convert_window_into(
+                Vec::new(),
+                ConvertSource {
+                    window,
+                    bounds,
+                    row_bytes: 32 * 4,
+                    data: src.as_ptr(),
+                    depth: PixelDepth::Byte,
+                    components: PixelComponents::Rgba,
+                },
+                ConvertSpec {
+                    parallel_rows: false,
+                    ..ConvertSpec::RGBA
+                },
+                None,
+            )
+        }
+        .unwrap_err();
+        assert!(matches!(err, MediaError::EmptyWindow));
+    }
+
+    #[test]
+    fn parallel_without_host_errors() {
+        let window = RectI {
+            x1: 0,
+            y1: 0,
+            x2: 64,
+            y2: 64,
+        };
+        let src = vec![0u8; 64 * 64 * 4];
+        let err = unsafe {
+            convert_window_into(
+                Vec::new(),
+                ConvertSource {
+                    window,
+                    bounds: window,
+                    row_bytes: 64 * 4,
+                    data: src.as_ptr(),
+                    depth: PixelDepth::Byte,
+                    components: PixelComponents::Rgba,
+                },
+                ConvertSpec::RGBA,
+                None,
+            )
+        }
+        .unwrap_err();
+        assert!(matches!(err, MediaError::MissingMultiThread));
+    }
+
+    fn test_multithread() -> &'static MultiThread {
+        use openfx::bindings::OfxMultiThreadSuiteV1;
+        use openfx::status::kOfxStat;
+
+        unsafe extern "C" fn mock_multi_thread(
+            func: openfx::bindings::OfxThreadFunctionV1,
+            n_threads: u32,
+            custom_arg: *mut std::ffi::c_void,
+        ) -> openfx::OfxStatus {
+            let Some(func) = func else {
+                return kOfxStat::Failed;
+            };
+            for thread_index in 0..n_threads {
+                unsafe { func(thread_index, n_threads, custom_arg) };
+            }
+            kOfxStat::OK
+        }
+
+        unsafe extern "C" fn mock_num_cpus(n_cpus: *mut u32) -> openfx::OfxStatus {
+            if n_cpus.is_null() {
+                return kOfxStat::Failed;
+            }
+            unsafe { *n_cpus = 4 };
+            kOfxStat::OK
+        }
+
+        static SUITE: OfxMultiThreadSuiteV1 = OfxMultiThreadSuiteV1 {
+            multiThread: Some(mock_multi_thread),
+            multiThreadNumCPUs: Some(mock_num_cpus),
+            multiThreadIndex: None,
+            multiThreadIsSpawnedThread: None,
+            mutexCreate: None,
+            mutexDestroy: None,
+            mutexLock: None,
+            mutexUnLock: None,
+            mutexTryLock: None,
+        };
+        static MT: MultiThread = MultiThread::from_suite(&SUITE);
+        &MT
     }
 }
